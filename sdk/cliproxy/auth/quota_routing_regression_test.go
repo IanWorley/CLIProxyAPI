@@ -146,3 +146,24 @@ func TestSoonestQuotaResetKnownRecoveryWinsOverMissingReset(t *testing.T) {
 		t.Fatalf("Retry-After = %q; want %q", got, want)
 	}
 }
+
+func TestSoonestQuotaResetUsesHTTPWhenWebsocketCredentialIsExhausted(t *testing.T) {
+	now := quotaTestNow
+	quotaSignals := func(used string) QuotaState {
+		return QuotaState{ObservedAt: now, Signals: map[string]string{
+			"X-Codex-Primary-Used-Percent":          used,
+			"X-Codex-Primary-Reset-After-Seconds":   strconv.Itoa(int(quotaRoutingShortReset.Seconds())),
+			"X-Codex-Secondary-Used-Percent":        "20",
+			"X-Codex-Secondary-Reset-After-Seconds": strconv.Itoa(int(quotaRoutingSoonReset.Seconds())),
+		}}
+	}
+	websocket := &Auth{ID: "websocket-exhausted", Provider: "codex", Status: StatusActive, Attributes: map[string]string{"websockets": "true"}, Quota: quotaSignals("100")}
+	httpOnly := &Auth{ID: "http-usable", Provider: "codex", Status: StatusActive, Quota: quotaSignals("20")}
+	selector := newTestSoonestSelector()
+	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
+
+	selected, errPick := selector.Pick(ctx, "codex", "", cliproxyexecutor.Options{}, []*Auth{websocket, httpOnly})
+	if errPick != nil || selected == nil || selected.ID != httpOnly.ID {
+		t.Fatalf("websocket request selected ID = %q, error = %v; want %s", quotaRoutingAuthID(selected), errPick, httpOnly.ID)
+	}
+}
