@@ -1024,7 +1024,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			return nil, errAvailable
 		}
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
-		return s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+		return s.fallback.Pick(withRoutingPickIntent(ctx, RoutingDecisionNoSession, ""), provider, model, opts, fallbackAuths)
 	}
 
 	// A single availability pass serves both lookups: the bound credential is validated against
@@ -1065,7 +1065,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			}
 		}
 		// Cached auth not available, reselect via fallback selector for even distribution
-		auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+		auth, err := s.fallback.Pick(withRoutingPickIntent(ctx, RoutingDecisionFailover, cachedAuthID), provider, model, opts, fallbackAuths)
 		if err != nil {
 			return nil, err
 		}
@@ -1095,7 +1095,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 
-	auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+	auth, err := s.fallback.Pick(withRoutingPickIntent(ctx, RoutingDecisionNewSession, ""), provider, model, opts, fallbackAuths)
 	if err != nil {
 		return nil, err
 	}
@@ -1187,7 +1187,7 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 	}
 
 	fallbackAuths := highestPriorityAuths(available)
-	auth, errPick := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+	auth, errPick := s.fallback.Pick(withRoutingPickIntent(ctx, RoutingDecisionNewSession, ""), provider, model, opts, fallbackAuths)
 	if errPick != nil {
 		return nil, true, errPick
 	}
