@@ -10,3 +10,12 @@ func TestNormalizeRoutingStrategyWeightedRoundRobin(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeRoutingStrategySoonestQuotaReset(t *testing.T) {
+	for _, input := range []string{"soonest-quota-reset", "SoonestQuotaReset", "sqr"} {
+		got, ok := normalizeRoutingStrategy(input)
+		if !ok || got != "soonest-quota-reset" {
+			t.Fatalf("normalizeRoutingStrategy(%q) = %q, %v; want soonest-quota-reset, true", input, got, ok)
+		}
+	}
+}

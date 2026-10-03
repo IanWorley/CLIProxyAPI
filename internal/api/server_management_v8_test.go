@@ -90,13 +90,16 @@ func TestManagementV8IndependentContract(t *testing.T) {
 		"GET /v8/management/observability/logs", "GET /v8/management/observability/usage/queue",
 		"GET /v8/management/credentials", "POST /v8/management/credentials",
 		"GET /v8/management/oauth/auth-url", "POST /v8/management/oauth/import", "POST /v8/management/oauth/callback",
-		"POST /v8/management/routing/cooldown/reset",
+		"POST /v8/management/routing/cooldown/reset", "GET /v8/management/routing/quota-status",
 		"GET /v8/management/plugins/:id/quota", "POST /v8/management/plugins/:id/quota", "DELETE /v8/management/plugins/:id/quota",
 		"POST /v8/management/plugins/store/:id/install", "DELETE /v8/management/plugins/:id",
 	} {
 		if !routes[route] {
 			t.Errorf("missing route %s", route)
 		}
+	}
+	if routes["GET /v0/management/routing/quota-status"] {
+		t.Error("quota status remains on deprecated v0 management API")
 	}
 	request := func(method, url, body string, status int) string {
 		t.Helper()
