@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -53,6 +54,7 @@ type QuotaRoutingEvaluation struct {
 //   - Shared windows come from the newest of the credential and per-model snapshots.
 //     Model-scoped windows (Claude 7d_oi, Codex additional limits) only come from the
 //     requested model's own snapshot, because they cannot be attributed otherwise.
+//     A Codex additional limit must also be the active limit or be named for the model.
 //   - A window whose reset time has passed has rolled over and is ignored.
 //   - Any applicable exhausted window excludes the credential until it resets, even
 //     when the snapshot is stale, so provider limits are never bypassed.
@@ -144,12 +146,23 @@ func applicableQuotaWindows(auth *Auth, model string) ([]QuotaWindow, time.Time)
 	}
 	if modelQuota != nil {
 		for _, window := range parseQuotaWindows(auth.Provider, *modelQuota) {
-			if window.ModelScoped {
+			if window.ModelScoped && quotaWindowAppliesToModel(window, model) {
 				windows = append(windows, window)
 			}
 		}
 	}
 	return windows, shared.ObservedAt
+}
+
+// quotaWindowAppliesToModel filters model-scoped windows found on a model's own snapshot.
+// Claude only reports 7d_oi for the models it meters, but every Codex response lists all
+// additional limits, so a named limit only applies when Codex marks it as the active limit
+// or when its name is the requested model.
+func quotaWindowAppliesToModel(window QuotaWindow, model string) bool {
+	if window.LimitName == "" {
+		return true
+	}
+	return window.ActiveLimit || strings.EqualFold(window.LimitName, canonicalModelKey(model))
 }
 
 // rankedQuotaCandidate pairs a credential with its evaluation.

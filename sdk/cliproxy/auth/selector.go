@@ -1338,6 +1338,7 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 		return nil, true, errAvailable
 	}
 
+	pickKind, previousAuthID := RoutingDecisionNewSession, ""
 	var preservedAuthID string
 	if match, ok := s.matcher.MatchFingerprintsWithContext(namespace, fingerprints, tailFingerprints, envDigest, minPrefixLength); ok {
 		for _, auth := range available {
@@ -1380,13 +1381,15 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 			}
 			return auth, true, nil
 		}
+		// The matched session is bound to a credential that is no longer available.
+		pickKind, previousAuthID = RoutingDecisionFailover, match.AuthID
 		if !match.IsFork && s.shouldPreserveBindingWhenUnavailable(ctx, availabilityCandidates, model, match.AuthID, now) {
 			preservedAuthID = match.AuthID
 		}
 	}
 
 	fallbackAuths := highestPriorityAuths(available)
-	auth, errPick := s.fallback.Pick(withRoutingPickIntent(ctx, RoutingDecisionNewSession, ""), provider, model, opts, fallbackAuths)
+	auth, errPick := s.fallback.Pick(withRoutingPickIntent(ctx, pickKind, previousAuthID), provider, model, opts, fallbackAuths)
 	if errPick != nil {
 		return nil, true, errPick
 	}

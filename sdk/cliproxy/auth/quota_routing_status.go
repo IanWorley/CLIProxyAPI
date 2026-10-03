@@ -103,7 +103,8 @@ func (m *Manager) QuotaRoutingReport(provider, model string) QuotaRoutingReport 
 
 	m.mu.RLock()
 	selector := soonestQuotaResetSelectorOf(m.selector)
-	report.Active = selector != nil
+	// Home dispatch bypasses the local selector, so its ranking does not route requests.
+	report.Active = selector != nil && !m.HomeEnabled()
 	indexByID := make(map[string]string, len(m.auths))
 	var rankable []rankedQuotaCandidate
 	for _, auth := range m.auths {
