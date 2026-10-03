@@ -27,6 +27,11 @@ const (
 	codexSignalPrefix       = "x-codex-"
 	codexAdditionalPrefix   = "additional-"
 	codexCodeReviewLimitKey = "code-review"
+	codexBaseLimitID        = "codex"
+	codexActiveLimitSignal  = codexSignalPrefix + "active-limit"
+	codexLimitReachedSuffix = "limit-reached"
+	codexLimitNameSuffix    = "limit-name"
+	codexSignalTrue         = "true"
 )
 
 // QuotaWindowKind classifies a provider quota window.
@@ -46,6 +51,10 @@ type QuotaWindow struct {
 	Name        string          `json:"name"`
 	Kind        QuotaWindowKind `json:"kind"`
 	ModelScoped bool            `json:"model_scoped,omitempty"`
+	// LimitName is the provider's name for a Codex additional limit, such as a model name.
+	LimitName string `json:"limit_name,omitempty"`
+	// ActiveLimit reports that Codex named this window's limit as the one metering the response.
+	ActiveLimit bool `json:"active_limit,omitempty"`
 	// UsedPercent is nil when the provider did not report usage for this window.
 	UsedPercent *float64  `json:"used_percent,omitempty"`
 	Exhausted   bool      `json:"exhausted"`
@@ -132,6 +141,7 @@ var codexWindowUsedPattern = regexp.MustCompile(`^x-codex-(?:(.+)-)?(primary|sec
 
 func parseCodexQuotaWindows(signals map[string]string, observedAt time.Time) []QuotaWindow {
 	var windows []QuotaWindow
+	mostUsedByLimit := make(map[string]int)
 	for key, rawUsed := range signals {
 		match := codexWindowUsedPattern.FindStringSubmatch(key)
 		if match == nil {
@@ -146,12 +156,13 @@ func parseCodexQuotaWindows(signals map[string]string, observedAt time.Time) []Q
 		if !ok || used < 0 {
 			continue
 		}
-		prefix := codexSignalPrefix + slot + "-"
+		limitPrefix := codexSignalPrefix
 		name := slot
 		if limit != "" {
-			prefix = codexSignalPrefix + limit + "-" + slot + "-"
+			limitPrefix = codexSignalPrefix + limit + "-"
 			name = strings.TrimPrefix(limit, codexAdditionalPrefix) + ":" + slot
 		}
+		prefix := limitPrefix + slot + "-"
 		window := QuotaWindow{
 			Name:        name,
 			Kind:        codexWindowKind(slot, signals[prefix+"window-minutes"]),
@@ -159,14 +170,51 @@ func parseCodexQuotaWindows(signals map[string]string, observedAt time.Time) []Q
 			UsedPercent: &used,
 			Exhausted:   used >= quotaPercentMax,
 		}
+		if limit != "" {
+			window.LimitName = signals[limitPrefix+codexLimitNameSuffix]
+			if window.LimitName == "" {
+				window.LimitName = strings.TrimPrefix(limit, codexAdditionalPrefix)
+			}
+			window.ActiveLimit = codexLimitIsActive(signals[codexActiveLimitSignal], limit)
+		}
 		if resetAt, okReset := parseQuotaResetTime(signals[prefix+"reset-at"]); okReset {
 			window.ResetAt = resetAt
 		} else if seconds, okAfter := parseFiniteFloat(signals[prefix+"reset-after-seconds"]); okAfter && seconds >= 0 && !observedAt.IsZero() {
 			window.ResetAt = observedAt.Add(time.Duration(seconds * float64(time.Second)))
 		}
 		windows = append(windows, window)
+
+		// Remember the most consumed window of each limit that Codex reports as reached.
+		if !strings.EqualFold(signals[limitPrefix+codexLimitReachedSuffix], codexSignalTrue) {
+			continue
+		}
+		index := len(windows) - 1
+		if previous, found := mostUsedByLimit[limit]; !found || used > *windows[previous].UsedPercent ||
+			(used == *windows[previous].UsedPercent && window.ResetAt.After(windows[previous].ResetAt)) {
+			mostUsedByLimit[limit] = index
+		}
+	}
+	// A reached limit is exhausted even when the rounded percentages stay below 100.
+	// The most consumed window is the one blocking it.
+	for _, index := range mostUsedByLimit {
+		windows[index].Exhausted = true
 	}
 	return windows
+}
+
+// codexLimitIsActive reports whether the active-limit signal names the given limit
+// namespace. Codex reports limit IDs such as "codex_bengalfox" while header namespaces
+// drop the "codex" prefix ("bengalfox") or carry the limit name ("additional-<name>").
+func codexLimitIsActive(activeLimit, namespace string) bool {
+	normalize := func(value string) string {
+		return strings.ReplaceAll(strings.ToLower(strings.TrimSpace(value)), "_", "-")
+	}
+	active := normalize(activeLimit)
+	if active == "" {
+		return false
+	}
+	namespace = strings.TrimPrefix(normalize(namespace), codexAdditionalPrefix)
+	return active == namespace || active == codexBaseLimitID+"-"+namespace
 }
 
 // codexWindowKind classifies by the reported window length. Without a length, Codex's

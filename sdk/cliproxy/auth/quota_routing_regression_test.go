@@ -12,6 +12,7 @@ import (
 	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 const (
@@ -191,5 +192,102 @@ func TestSoonestQuotaResetUsesHTTPWhenWebsocketCredentialIsExhausted(t *testing.
 	selected, errPick := selector.Pick(ctx, "codex", "", cliproxyexecutor.Options{}, []*Auth{websocket, httpOnly})
 	if errPick != nil || selected == nil || selected.ID != httpOnly.ID {
 		t.Fatalf("websocket request selected ID = %q, error = %v; want %s", quotaRoutingAuthID(selected), errPick, httpOnly.ID)
+	}
+}
+
+// codexSparkLimitAuth has a healthy base limit and an exhausted Spark additional limit,
+// observed on a response for the given model.
+func codexSparkLimitAuth(model, activeLimit string) *Auth {
+	signals := map[string]string{
+		"X-Codex-Secondary-Used-Percent":                        "40",
+		"X-Codex-Secondary-Reset-At":                            unixSignal(quotaTestNow.Add(quotaRoutingSoonReset)),
+		"X-Codex-Bengalfox-Limit-Name":                          "GPT-5.3-Codex-Spark",
+		"X-Codex-Bengalfox-Secondary-Used-Percent":              "100",
+		"X-Codex-Bengalfox-Secondary-Reset-At":                  unixSignal(quotaTestNow.Add(quotaRoutingLateReset)),
+		"X-Codex-Additional-Other-Limit-Secondary-Used-Percent": "100",
+	}
+	if activeLimit != "" {
+		signals["X-Codex-Active-Limit"] = activeLimit
+	}
+	quota := QuotaState{ObservedAt: quotaTestNow, Signals: signals}
+	return &Auth{ID: "codex-spark", Provider: "codex", Quota: quota, ModelStates: map[string]*ModelState{model: {Quota: quota}}}
+}
+
+func TestEvaluateQuotaForRoutingScopesCodexAdditionalLimitsToTheirModel(t *testing.T) {
+	for _, testCase := range []struct {
+		name        string
+		model       string
+		activeLimit string
+		wantTier    QuotaRoutingTier
+	}{
+		{name: "other model ignores spark limit", model: "gpt-5.5", activeLimit: "codex", wantTier: QuotaTierRanked},
+		{name: "limit named for the model applies", model: "gpt-5.3-codex-spark", wantTier: QuotaTierExhausted},
+		{name: "active limit applies", model: "gpt-5.5", activeLimit: "codex_bengalfox", wantTier: QuotaTierExhausted},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := EvaluateQuotaForRouting(codexSparkLimitAuth(testCase.model, testCase.activeLimit), testCase.model, quotaTestNow)
+			if got.Tier != testCase.wantTier {
+				t.Fatalf("tier = %s (blocking %q), want %s", got.Tier, got.BlockingWindow, testCase.wantTier)
+			}
+		})
+	}
+}
+
+func TestEvaluateQuotaForRoutingHonorsCodexLimitReached(t *testing.T) {
+	auth := &Auth{ID: "codex-reached", Provider: "codex", Quota: QuotaState{
+		ObservedAt: quotaTestNow,
+		Signals: map[string]string{
+			"X-Codex-Limit-Reached":          "true",
+			"X-Codex-Primary-Used-Percent":   "99",
+			"X-Codex-Primary-Reset-At":       unixSignal(quotaTestNow.Add(quotaRoutingShortReset)),
+			"X-Codex-Secondary-Used-Percent": "40",
+			"X-Codex-Secondary-Reset-At":     unixSignal(quotaTestNow.Add(quotaRoutingSoonReset)),
+		},
+	}}
+	got := EvaluateQuotaForRouting(auth, "", quotaTestNow)
+	if got.Tier != QuotaTierExhausted || got.BlockingWindow != "primary" {
+		t.Fatalf("evaluation = (%s, %q), want exhausted by primary", got.Tier, got.BlockingWindow)
+	}
+}
+
+func TestSessionAffinityLCPRecordsQuotaFailover(t *testing.T) {
+	quotaSelector := newTestSoonestSelector()
+	affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{Fallback: quotaSelector, TTL: time.Hour})
+	defer affinity.Stop()
+
+	sooner := freshClaudeRoutingAuth("lcp-sooner", quotaTestNow, quotaRoutingSoonReset, "allowed")
+	later := freshClaudeRoutingAuth("lcp-later", quotaTestNow, quotaRoutingLateReset, "allowed")
+	pick := func() *Auth {
+		t.Helper()
+		opts := cliproxyexecutor.Options{
+			SourceFormat:    sdktranslator.FormatOpenAI,
+			OriginalRequest: []byte(`{"messages":[{"role":"user","content":"lcp quota failover"}]}`),
+			Metadata:        map[string]any{cliproxyexecutor.CallerScopeMetadataKey: "caller-a"},
+		}
+		auth, errPick := affinity.Pick(context.Background(), "claude", "lcp-model", opts, []*Auth{sooner, later})
+		if errPick != nil {
+			t.Fatalf("Pick: %v", errPick)
+		}
+		return auth
+	}
+
+	if got := pick(); got.ID != sooner.ID {
+		t.Fatalf("new session = %s, want %s", got.ID, sooner.ID)
+	}
+	sooner.Quota.Signals["Anthropic-Ratelimit-Unified-5h-Status"] = "rejected"
+	if got := pick(); got.ID != later.ID {
+		t.Fatalf("failover = %s, want %s", got.ID, later.ID)
+	}
+	decision := quotaSelector.Decisions()[0]
+	if decision.Kind != RoutingDecisionFailover || decision.PreviousAuthID != sooner.ID {
+		t.Fatalf("decision = (%s, %q), want failover from %s", decision.Kind, decision.PreviousAuthID, sooner.ID)
+	}
+}
+
+func TestManagerQuotaRoutingReportInactiveUnderHomeDispatch(t *testing.T) {
+	manager := NewManager(nil, NewSoonestQuotaResetSelector(), nil)
+	manager.SetConfig(&internalconfig.Config{Home: internalconfig.HomeConfig{Enabled: true}})
+	if manager.QuotaRoutingReport("", "").Active {
+		t.Fatal("report.Active = true while Home owns selection, want false")
 	}
 }
