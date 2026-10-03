@@ -136,7 +136,9 @@ routing:
   #   window is respected: an exhausted short window (5h/daily) excludes a credential even when
   #   weekly allowance remains. Exhausted windows exclude a credential until their reset time.
   # - Model-specific windows (Claude 7d_oi, Codex additional limits) only count when they were
-  #   observed on responses for the resolved upstream model.
+  #   observed on responses for the resolved upstream model. A Codex additional limit must also
+  #   be the response's active limit or be named for that model.
+  # - A Codex limit reported as reached excludes the credential even when usage reads below 100%.
   # - Deterministic fallback: credentials with missing, stale (older than 1h), or unsupported
   #   quota data, or with no weekly reset time, rank after credentials with fresh data and are
   #   ordered by credential ID. Values are never estimated.
