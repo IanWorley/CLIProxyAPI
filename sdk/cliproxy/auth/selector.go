@@ -506,7 +506,7 @@ func getSelectorAvailableAuthsWithPriorityMode(ctx context.Context, auths []*Aut
 			// The manager already resolved each credential's upstream model and supplied
 			// ID-sorted candidates. Rechecking the alias or an empty model would apply
 			// unrelated cooldowns. Affinity bindings may span all priority tiers, but
-			// fallback selection must still use the highest available tier.
+			// ordinary fallback selection still uses the highest available tier.
 			if !allPriorities {
 				return highestPriorityAuths(auths), nil
 			}
@@ -971,6 +971,14 @@ func (s *SessionAffinitySelector) Trees() *cliproxysession.InMemorySessionTreeSt
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
 // that may be supported by different auth credentials, and to avoid cross-provider conflicts.
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	fallbackCandidates := auths
+	if quotaSelector := soonestQuotaResetSelectorOf(s.fallback); quotaSelector != nil {
+		eligible := quotaEligibleAuths(ctx, auths, model, quotaSelector.now())
+		if len(eligible) == 0 {
+			return s.fallback.Pick(ctx, provider, model, opts, auths)
+		}
+		auths = eligible
+	}
 	entry := selectorLogEntry(ctx)
 	if opts.Metadata == nil {
 		opts.Metadata = make(map[string]any)
@@ -1023,17 +1031,23 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		if errAvailable != nil {
 			return nil, errAvailable
 		}
+		if soonestQuotaResetSelectorOf(s.fallback) != nil {
+			fallbackAuths = fallbackCandidates
+		}
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
 		return s.fallback.Pick(withRoutingPickIntent(ctx, RoutingDecisionNoSession, ""), provider, model, opts, fallbackAuths)
 	}
 
 	// A single availability pass serves both lookups: the bound credential is validated against
-	// every priority tier, while the fallback selector keeps seeing only the highest tier.
+	// every priority tier, while ordinary fallback selection uses only the highest tier.
 	available, err := getSelectorAvailableAuthsAcrossPriorities(ctx, availabilityCandidates, provider, model, now)
 	if err != nil {
 		return nil, err
 	}
 	fallbackAuths := highestPriorityAuths(available)
+	if soonestQuotaResetSelectorOf(s.fallback) != nil {
+		fallbackAuths = fallbackCandidates
+	}
 
 	modelKey := canonicalModelKey(model)
 	cacheKey := provider + "::" + primaryID + "::" + modelKey

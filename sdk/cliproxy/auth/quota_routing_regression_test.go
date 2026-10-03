@@ -72,6 +72,19 @@ func TestManagerSoonestQuotaResetFailsOverAfterPassiveExhaustion(t *testing.T) {
 	if errPick != nil || selected == nil || selected.ID != "passive-late" {
 		t.Fatalf("pick after passive exhaustion ID = %q, error = %v; want passive-late", quotaRoutingAuthID(selected), errPick)
 	}
+	decisions := selector.Decisions()
+	if len(decisions) == 0 || decisions[0].Kind != RoutingDecisionFailover || decisions[0].PreviousAuthID != first.ID {
+		t.Fatalf("failover decision = %+v; want previous credential %s", decisions, first.ID)
+	}
+	foundExhausted := false
+	for _, candidate := range decisions[0].Candidates {
+		if candidate.AuthID == first.ID && candidate.Tier == QuotaTierExhausted {
+			foundExhausted = true
+		}
+	}
+	if !foundExhausted {
+		t.Fatalf("failover candidates = %+v; want exhausted credential %s", decisions[0].Candidates, first.ID)
+	}
 }
 
 func TestManagerSoonestQuotaResetUsesLowerPriorityWhenTopIsExhausted(t *testing.T) {
@@ -120,6 +133,19 @@ func TestManagerSoonestQuotaResetAppliesAliasedModelQuota(t *testing.T) {
 	selected, _, errPick := manager.pickNext(context.Background(), "claude", routeModel, cliproxyexecutor.Options{}, nil)
 	if errPick != nil || selected == nil || selected.ID != later.ID {
 		t.Fatalf("aliased model pick ID = %q, error = %v; want %s", quotaRoutingAuthID(selected), errPick, later.ID)
+	}
+	report := manager.QuotaRoutingReport("claude", routeModel)
+	found := false
+	for _, account := range report.Accounts {
+		if account.AuthIndex == safeAuthIndex(soon) {
+			found = true
+			if account.Eligible || account.Reason != QuotaReasonLongExhausted {
+				t.Fatalf("aliased model status = %+v; want weekly exhaustion", account)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("aliased model status omitted the exhausted credential")
 	}
 }
 

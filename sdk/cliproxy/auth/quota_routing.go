@@ -158,6 +158,29 @@ type rankedQuotaCandidate struct {
 	evaluation QuotaRoutingEvaluation
 }
 
+type quotaRoutingModelsKey struct{}
+
+func quotaRoutingModel(ctx context.Context, auth *Auth, routeModel string) string {
+	if ctx != nil {
+		if models, ok := ctx.Value(quotaRoutingModelsKey{}).(map[string]string); ok {
+			if model, found := models[auth.ID]; found {
+				return model
+			}
+		}
+	}
+	return routeModel
+}
+
+func quotaEligibleAuths(ctx context.Context, auths []*Auth, routeModel string, now time.Time) []*Auth {
+	eligible := make([]*Auth, 0, len(auths))
+	for _, auth := range auths {
+		if auth != nil && EvaluateQuotaForRouting(auth, quotaRoutingModel(ctx, auth, routeModel), now).Tier != QuotaTierExhausted {
+			eligible = append(eligible, auth)
+		}
+	}
+	return eligible
+}
+
 var quotaTierOrder = map[QuotaRoutingTier]int{
 	QuotaTierRanked:    0,
 	QuotaTierFallback:  1,
@@ -168,13 +191,13 @@ var quotaTierOrder = map[QuotaRoutingTier]int{
 //  1. ranked: earliest long-window reset first, then credential ID
 //  2. fallback: credential ID (the fill-first order)
 //  3. exhausted: earliest recovery first, then credential ID (never selected)
-func rankByQuotaReset(auths []*Auth, model string, now time.Time) []rankedQuotaCandidate {
+func rankByQuotaReset(ctx context.Context, auths []*Auth, model string, now time.Time) []rankedQuotaCandidate {
 	ranked := make([]rankedQuotaCandidate, 0, len(auths))
 	for _, auth := range auths {
 		if auth == nil {
 			continue
 		}
-		ranked = append(ranked, rankedQuotaCandidate{auth: auth, evaluation: EvaluateQuotaForRouting(auth, model, now)})
+		ranked = append(ranked, rankedQuotaCandidate{auth: auth, evaluation: EvaluateQuotaForRouting(auth, quotaRoutingModel(ctx, auth, model), now)})
 	}
 	sort.SliceStable(ranked, func(i, j int) bool {
 		left, right := ranked[i].evaluation, ranked[j].evaluation
@@ -188,6 +211,12 @@ func rankByQuotaReset(auths []*Auth, model string, now time.Time) []rankedQuotaC
 			}
 		case QuotaTierExhausted:
 			if !left.BlockedUntil.Equal(right.BlockedUntil) {
+				if left.BlockedUntil.IsZero() {
+					return false
+				}
+				if right.BlockedUntil.IsZero() {
+					return true
+				}
 				return left.BlockedUntil.Before(right.BlockedUntil)
 			}
 		}
@@ -230,30 +259,34 @@ func (s *SoonestQuotaResetSelector) now() time.Time {
 func (s *SoonestQuotaResetSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	_ = opts
 	now := s.now()
-	available, errAvailable := getSelectorAvailableAuths(ctx, auths, provider, model, now)
+	available, errAvailable := getSelectorAvailableAuthsAcrossPriorities(ctx, auths, provider, model, now)
 	if errAvailable != nil {
 		return nil, errAvailable
 	}
-	available = preferCodexWebsocketAuths(ctx, provider, available)
-	ranked := rankByQuotaReset(available, model, now)
+	ranked := rankByQuotaReset(ctx, available, model, now)
 	if len(ranked) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
-
-	best := ranked[0]
-	if best.evaluation.Tier == QuotaTierExhausted {
+	eligible := make([]*Auth, 0, len(ranked))
+	for _, candidate := range ranked {
+		if candidate.evaluation.Tier != QuotaTierExhausted {
+			eligible = append(eligible, candidate.auth)
+		}
+	}
+	if len(eligible) == 0 {
 		s.decisions.Record(newRoutingDecision(ctx, provider, model, nil, ranked, now))
-		// Every candidate is exhausted: report the earliest provider reset instead of
-		// cycling through credentials the provider would reject.
-		if best.evaluation.BlockedUntil.After(now) {
+		if ranked[0].evaluation.BlockedUntil.After(now) {
 			providerForError := provider
 			if providerForError == "mixed" {
 				providerForError = ""
 			}
-			return nil, newModelCooldownError(model, providerForError, best.evaluation.BlockedUntil.Sub(now))
+			return nil, newModelCooldownError(model, providerForError, ranked[0].evaluation.BlockedUntil.Sub(now))
 		}
 		return nil, newAuthUnavailableError(time.Time{}, now)
 	}
+	eligible = highestPriorityAuths(eligible)
+	eligible = preferCodexWebsocketAuths(ctx, provider, eligible)
+	best := rankByQuotaReset(ctx, eligible, model, now)[0]
 	s.decisions.Record(newRoutingDecision(ctx, provider, model, best.auth, ranked, now))
 	return best.auth, nil
 }

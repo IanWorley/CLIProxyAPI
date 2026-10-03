@@ -158,8 +158,7 @@ func (m *Manager) quotaRoutingAccountStatusLocked(registryRef *registry.ModelReg
 	if model != "" {
 		checkModel = m.selectionModelForAuth(auth, model)
 	}
-	// Mirror the selector, which ranks with the requested route model.
-	evaluation := EvaluateQuotaForRouting(auth, model, now)
+	evaluation := EvaluateQuotaForRouting(auth, checkModel, now)
 	status.Tier = evaluation.Tier
 	status.Reason = evaluation.Reason
 	status.RankingWindow = evaluation.RankingWindow

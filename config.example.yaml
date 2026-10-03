@@ -136,13 +136,13 @@ routing:
   #   window is respected: an exhausted short window (5h/daily) excludes a credential even when
   #   weekly allowance remains. Exhausted windows exclude a credential until their reset time.
   # - Model-specific windows (Claude 7d_oi, Codex additional limits) only count when they were
-  #   observed on responses for the requested model.
+  #   observed on responses for the resolved upstream model.
   # - Deterministic fallback: credentials with missing, stale (older than 1h), or unsupported
   #   quota data, or with no weekly reset time, rank after credentials with fresh data and are
   #   ordered by credential ID. Values are never estimated.
   # - Ties on reset time are broken by credential ID. Credential priority still applies first.
-  # - If every candidate is exhausted, requests fail with 429 and Retry-After set to the
-  #   earliest reset instead of cycling through credentials.
+  # - If every candidate is exhausted and a reset time is known, requests fail with 429 and
+  #   Retry-After set to the earliest known reset. With no known reset, no retry time is estimated.
   # - Not applied while CLIProxyAPIHome dispatch is enabled (Home owns selection there).
   # weighted-round-robin uses each credential's integer weight (default 1, maximum 1,000,000).
   # Non-positive weights exclude the credential while this strategy is active.
