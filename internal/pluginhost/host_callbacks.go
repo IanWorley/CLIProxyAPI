@@ -179,8 +179,12 @@ func (h *Host) callFromPlugin(ctx context.Context, method string, request []byte
 		return h.callHostAuthGetRuntime(ctx, request)
 	case pluginabi.MethodHostAuthSave:
 		return h.callHostAuthSave(ctx, request)
+	case pluginabi.MethodHostAuthModels:
+		return h.callHostAuthModels(ctx, request)
 	case pluginabi.MethodHostAffinityLookup:
 		return h.callHostAffinityLookup(ctx, request)
+	case pluginabi.MethodHostRoutingResetCooldown:
+		return h.callHostRoutingResetCooldown(ctx, request)
 	default:
 		return nil, fmt.Errorf("unsupported host callback %s", method)
 	}
@@ -384,9 +388,7 @@ func (h *Host) callHostStreamEmit(ctx context.Context, request []byte) ([]byte, 
 		return nil, fmt.Errorf("decode stream emit request: %w", errUnmarshal)
 	}
 	chunk := pluginapi.ExecutorStreamChunk{Payload: append([]byte(nil), req.Payload...)}
-	if req.Error != "" {
-		chunk.Err = fmt.Errorf("%s", req.Error)
-	}
+	chunk.Err = rpcStreamError(req.Error, req.ErrorDetail)
 	if errEmit := h.streams.emit(ctx, req.StreamID, chunk); errEmit != nil {
 		return nil, errEmit
 	}
@@ -398,7 +400,7 @@ func (h *Host) callHostStreamClose(request []byte) ([]byte, error) {
 	if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
 		return nil, fmt.Errorf("decode stream close request: %w", errUnmarshal)
 	}
-	h.streams.close(req.StreamID, req.Error)
+	h.streams.closeWithError(req.StreamID, rpcStreamError(req.Error, req.ErrorDetail))
 	return marshalRPCResult(rpcEmptyResponse{})
 }
 

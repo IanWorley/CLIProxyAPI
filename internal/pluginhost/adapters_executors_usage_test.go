@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -887,6 +888,54 @@ func TestUsageAdapterRecoversSessionHierarchyFromContext(t *testing.T) {
 	}
 }
 
+func TestUsageAdapterPropagatesNativeKeyAndAccessProvider(t *testing.T) {
+	plugin := &capturingUsagePlugin{captured: make(chan pluginapi.UsageRecord, 1)}
+	host := newHostWithRecords(capabilityRecord{
+		id: "usage-native-key",
+		plugin: pluginapi.Plugin{Capabilities: pluginapi.Capabilities{
+			UsagePlugin: plugin,
+		}},
+	})
+	adapter := &usageAdapter{
+		host:     host,
+		pluginID: "usage-native-key",
+	}
+
+	// 1. Direct record propagation
+	adapter.HandleUsage(context.Background(), coreusage.Record{
+		Provider:       "test-provider",
+		Model:          "test-model",
+		APIKey:         "sk-native-key",
+		IsNativeKey:    true,
+		AccessProvider: "config-inline",
+	})
+	rec := <-plugin.captured
+	if !rec.IsNativeKey {
+		t.Fatalf("rec.IsNativeKey = false, want true")
+	}
+	if rec.AccessProvider != "config-inline" {
+		t.Fatalf("rec.AccessProvider = %q, want %q", rec.AccessProvider, "config-inline")
+	}
+
+	// 2. Fallback to context values when record fields are omitted
+	ctx := coreusage.WithAPIKey(context.Background(), "sk-ctx-native")
+	ctx = coreusage.WithAccessProvider(ctx, "config-inline")
+	adapter.HandleUsage(ctx, coreusage.Record{
+		Provider: "test-provider",
+		Model:    "test-model",
+	})
+	recCtx := <-plugin.captured
+	if recCtx.APIKey != "sk-ctx-native" {
+		t.Fatalf("recCtx.APIKey = %q, want sk-ctx-native", recCtx.APIKey)
+	}
+	if !recCtx.IsNativeKey {
+		t.Fatalf("recCtx.IsNativeKey = false, want true")
+	}
+	if recCtx.AccessProvider != "config-inline" {
+		t.Fatalf("recCtx.AccessProvider = %q, want config-inline", recCtx.AccessProvider)
+	}
+}
+
 func TestExecutorAdapterExecuteAttributesResponsesUsageToSelectedAuth(t *testing.T) {
 	plugin := newTestUsageCapturePlugin("plugin-provider-responses")
 	registerTestUsagePlugin(t, "test-executor-adapter-responses-auth-usage", plugin)
@@ -943,5 +992,70 @@ func TestExecutorAdapterExecuteAttributesResponsesUsageToSelectedAuth(t *testing
 	}
 	if rec.Detail.InputTokens != 34 || rec.Detail.OutputTokens != 499 || rec.Detail.TotalTokens != 533 {
 		t.Errorf("usage = %+v, want input=34 output=499 total=533", rec.Detail)
+	}
+}
+
+func TestExecutorAdapterExecuteStreamLargeSSELineKeepsUsage(t *testing.T) {
+	plugin := newTestUsageCapturePlugin("plugin-provider-bigline")
+	registerTestUsagePlugin(t, "test-executor-adapter-bigline-usage", plugin)
+
+	executorRecord := normalizeTestCapabilityRecord(capabilityRecord{id: "executor-plugin-bigline"})
+	host := newHostWithRecords(executorRecord)
+
+	echo := strings.Repeat("i", 70*1024)
+	terminal := `event: response.completed` + "\n" +
+		`data: {"type":"response.completed","response":{"instructions":"` + echo +
+		`","usage":{"input_tokens":7000,"output_tokens":30,"total_tokens":7030}}}` + "\n\n"
+	prefix := "event: response.created\ndata: {\"type\":\"response.created\"}\n\n"
+	whole := prefix + terminal
+
+	// The first read ends 66KB into the terminal data line: more than 64KB
+	// has accumulated and the newline has not arrived yet.
+	streamChunks := make(chan pluginapi.ExecutorStreamChunk, 4)
+	streamChunks <- pluginapi.ExecutorStreamChunk{Payload: []byte(whole[:66000])}
+	streamChunks <- pluginapi.ExecutorStreamChunk{Payload: []byte(whole[66000:])}
+	close(streamChunks)
+
+	exec := &fakeExecutor{
+		identifier: "plugin-provider-bigline",
+		executeStream: func(ctx context.Context, req pluginapi.ExecutorRequest) (pluginapi.ExecutorStreamResponse, error) {
+			return pluginapi.ExecutorStreamResponse{Chunks: streamChunks}, nil
+		},
+	}
+
+	adapter := newExecutorAdapterForRecordForTest(host, executorRecord, exec,
+		[]sdktranslator.Format{sdktranslator.FormatOpenAIResponse},
+		[]sdktranslator.Format{sdktranslator.FormatOpenAIResponse},
+	)
+	adapter.provider = "plugin-provider-bigline"
+
+	auth := &coreauth.Auth{ID: "auth-bigline-1", Provider: "plugin-provider-bigline"}
+	req := coreexecutor.Request{Model: "test-model", Payload: []byte(`{"model":"test-model","stream":true}`)}
+	opts := coreexecutor.Options{
+		SourceFormat:   sdktranslator.FormatOpenAIResponse,
+		ResponseFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:         true,
+	}
+
+	streamRes, errExecuteStream := adapter.ExecuteStream(context.Background(), auth, req, opts)
+	if errExecuteStream != nil {
+		t.Fatalf("ExecuteStream returned unexpected error: %v", errExecuteStream)
+	}
+	var got strings.Builder
+	for chunk := range streamRes.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("unexpected chunk error: %v", chunk.Err)
+		}
+		got.Write(chunk.Payload)
+	}
+	if got.String() != whole {
+		t.Fatal("payload was altered")
+	}
+
+	rec := plugin.waitRecord(t, 500*time.Millisecond)
+	if rec.Detail.InputTokens != 7000 || rec.Detail.OutputTokens != 30 || rec.Detail.TotalTokens != 7030 {
+		t.Errorf("got usage input=%d output=%d total=%d, want input=7000 output=30 total=7030: "+
+			"the terminal frame's usage was dropped",
+			rec.Detail.InputTokens, rec.Detail.OutputTokens, rec.Detail.TotalTokens)
 	}
 }

@@ -11,7 +11,9 @@ import (
 
 	"github.com/google/uuid"
 	xaiauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/xai"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -23,6 +25,7 @@ import (
 )
 
 type xaiPreparedRequest struct {
+	finalizePayload       helps.PayloadFinalizer
 	applyPatch            *helps.ApplyPatchResponsesState
 	baseModel             string
 	from                  sdktranslator.Format
@@ -57,6 +60,13 @@ type xaiClientToolKey struct {
 	toolType  string
 }
 
+func resolveXAISignatureTargetModel(baseModel string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) string {
+	if resolved := resolveResponsesSignatureTargetModel(baseModel, req, opts); signature.SignatureProviderFromModelName(resolved) == signature.SignatureProviderGrok {
+		return resolved
+	}
+	return "grok"
+}
+
 func (e *XAIExecutor) prepareResponsesRequest(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) (*xaiPreparedRequest, error) {
 	return e.prepareResponsesRequestTo(ctx, req, opts, stream, sdktranslator.FormatCodex)
 }
@@ -70,20 +80,23 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 		originalPayloadSource = opts.OriginalRequest
 	}
 	originalPayload := bytes.Clone(originalPayloadSource)
-	originalTranslated := helps.TranslateRequestWithAPIKeyModelCompatibilityForExecutor(ctx, opts.Headers, e.cfg, e.Identifier(), from, to, baseModel, originalPayload, stream, helps.APIKeyModelIsCompat(req))
+	targetModel := resolveXAISignatureTargetModel(baseModel, req, opts)
+	originalTranslated := helps.TranslateRequestWithAPIKeyModelCompatibilityForExecutor(ctx, opts.Headers, e.cfg, e.Identifier(), from, to, targetModel, originalPayload, stream, helps.APIKeyModelIsCompat(req))
+	originalTranslated = helps.SetStringIfDifferent(originalTranslated, "model", baseModel)
 	originalTranslated = preserveXAIResponsesOutputControls(originalTranslated, originalPayload, from)
-	body, updatesChanged := helps.TranslateRequestWithAPIKeyModelCompatibilityAndUpdateIntentForExecutor(ctx, opts.Headers, e.cfg, e.Identifier(), from, to, baseModel, bytes.Clone(req.Payload), stream, helps.APIKeyModelIsCompat(req))
+	body, updatesChanged, err := helps.TranslateRequestWithAPIKeyModelCompatibilityAndUpdateIntentForExecutor(ctx, opts.Headers, e.cfg, e.Identifier(), from, to, targetModel, bytes.Clone(req.Payload), stream, helps.APIKeyModelIsCompat(req))
+	if err != nil {
+		return nil, err
+	}
+	body = helps.SetStringIfDifferent(body, "model", baseModel)
 	body = preserveXAIResponsesOutputControls(body, req.Payload, from)
 
-	var err error
 	body, err = helps.ApplyRequestThinking(body, req, opts, from.String(), e.Identifier(), e.Identifier(), updatesChanged)
 	if err != nil {
 		return nil, err
 	}
 
-	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
-	requestPath := helps.PayloadRequestPath(opts)
-	body = helps.ApplyPayloadConfigWithRequestForExecutor(e.cfg, e.Identifier(), baseModel, to.String(), from.String(), "", body, originalTranslated, requestedModel, requestPath, opts.Headers)
+	finalizePayload := helps.NewPayloadFinalizer(e.cfg, e.Identifier(), baseModel, to.String(), "", originalTranslated, req, opts)
 	body = helps.SetStringIfDifferent(body, "model", baseModel)
 	body = helps.SetBoolIfDifferent(body, "stream", stream)
 	body, _ = sjson.DeleteBytes(body, "previous_response_id")
@@ -142,7 +155,7 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 		body = aliasXAIClientWebSearchInput(body, webSearchAlias, namespaceTools)
 	}
 	body = normalizeXAIInputReasoningItems(body)
-	body = sanitizeXAIInputEncryptedContent(body)
+	body = sanitizeXAIInputEncryptedContentWithOptions(body, true)
 	body = normalizeCodexInstructions(body)
 	// stop is supported by Chat Completions but not by xAI's Responses API.
 	// Thinking was handled before payload overrides and must not be revalidated here.
@@ -158,6 +171,7 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	}
 
 	return &xaiPreparedRequest{
+		finalizePayload:       finalizePayload,
 		applyPatch:            applyPatch,
 		baseModel:             baseModel,
 		from:                  from,
@@ -253,9 +267,9 @@ func xaiUsingAPI(auth *cliproxyauth.Auth) bool {
 // is false (including its OAuth default), empty or official default base_url is
 // rewritten to the CLI chat-proxy endpoint; an explicit non-default base_url is
 // still honored.
-// Websocket and compact transports intentionally do not use this helper:
-// cli-chat-proxy does not implement /responses/compact (404) or websocket
-// upgrades (405).
+// Websocket, compact, and speech intentionally do not use this helper:
+// cli-chat-proxy does not implement /responses/compact (404), websocket
+// upgrades (405), or /tts. Speech uses xaiSpeechRequestURL.
 func xaiChatBaseURL(auth *cliproxyauth.Auth) string {
 	_, baseURL := xaiCreds(auth)
 	if xaiUsingAPI(auth) {
@@ -311,8 +325,20 @@ func logXAIResolvedBaseURL(ctx context.Context, baseURL string) {
 	helps.LogWithRequestID(ctx).Infof("xai: using base_url=%s source=%s", baseURL, xaiBaseURLSource(baseURL))
 }
 
+func xaiDefaultUserAgent() string {
+	return "xai-grok-workspace/" + xaiClientVersion()
+}
+
+func ensureXAIUserAgent(r *http.Request, clientHeaders ...http.Header) {
+	if r == nil {
+		return
+	}
+	misc.EnsureHeader(r.Header, util.ResolveClientHeaders(r, clientHeaders...), "User-Agent", xaiDefaultUserAgent())
+}
+
 func applyXAIHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, sessionID string, clientHeaders ...http.Header) {
 	applyXAIDefaultHeaders(r, token, stream, sessionID)
+	ensureXAIUserAgent(r, clientHeaders...)
 	applyXAICustomHeaders(r, auth, clientHeaders...)
 }
 
@@ -343,23 +369,23 @@ func applyXAICustomHeaders(r *http.Request, auth *cliproxyauth.Auth, clientHeade
 }
 
 // applyXAIChatHeaders applies standard xAI headers for non-image/video chat
-// requests. When using_api is true, this matches the standard
-// applyXAIHeaders behavior. CLI chat-proxy identity headers are only attached
-// when using_api is false and the resolved chat base URL is the official CLI
-// chat-proxy endpoint.
+// requests. When using_api is true or a custom non-CLI-proxy base URL is used,
+// this matches the standard applyXAIHeaders behavior (forwarding the downstream
+// User-Agent or falling back to the Grok workspace User-Agent). CLI chat-proxy
+// identity headers are only attached when using_api is false and the resolved
+// chat base URL is the official CLI chat-proxy endpoint.
 func applyXAIChatHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, stream bool, sessionID string, clientHeaders ...http.Header) {
-	if xaiUsingAPI(auth) {
+	if xaiUsingAPI(auth) || !xaiIsCLIChatProxyBaseURL(xaiChatBaseURL(auth)) {
 		applyXAIHeaders(r, auth, token, stream, sessionID, clientHeaders...)
 		return
 	}
 	applyXAIDefaultHeaders(r, token, stream, sessionID)
-	if xaiIsCLIChatProxyBaseURL(xaiChatBaseURL(auth)) {
-		r.Header.Set(xaiTokenAuthHeader, xaiTokenAuthValue)
-		r.Header.Set(xaiClientVersionHeader, xaiClientVersionValue)
-		r.Header.Set("User-Agent", "xai-grok-workspace/"+xaiClientVersionValue)
-		r.Header.Set(xaiClientIdentifierHeader, xaiClientIdentifierValue)
-		r.Header.Set(xaiAuthenticateResponseHeader, xaiAuthenticateResponseValue)
-	}
+	clientVer := xaiClientVersion()
+	r.Header.Set(xaiTokenAuthHeader, xaiTokenAuthValue)
+	r.Header.Set(xaiClientVersionHeader, clientVer)
+	r.Header.Set("User-Agent", "xai-grok-workspace/"+clientVer)
+	r.Header.Set(xaiClientIdentifierHeader, xaiClientIdentifierValue)
+	r.Header.Set(xaiAuthenticateResponseHeader, xaiAuthenticateResponseValue)
 	applyXAICustomHeaders(r, auth, clientHeaders...)
 }
 
@@ -502,6 +528,16 @@ func normalizeXAIImageRef(value any) bool {
 
 func xaiIsVideoRequest(opts cliproxyexecutor.Options) bool {
 	return opts.SourceFormat.String() == xaiVideoHandlerType
+}
+
+func xaiIsSpeechRequest(opts cliproxyexecutor.Options) bool {
+	return opts.SourceFormat.String() == xaiSpeechHandlerType
+}
+
+// xaiSpeechRequestURL stays on the official API. cli-chat-proxy does not implement /tts,
+// and a 404 there would cool the OAuth auth down as not_found.
+func xaiSpeechRequestURL(auth *cliproxyauth.Auth) string {
+	return strings.TrimSuffix(xaiCompactBaseURL(auth), "/") + xaiTTSPath
 }
 
 func xaiVideoEndpointPath(opts cliproxyexecutor.Options) string {
@@ -1558,6 +1594,29 @@ func normalizeXAINamespaceToolChoiceWithFold(body []byte, shouldFold bool) []byt
 	return body
 }
 
+// xaiUnsupportedWebSearchFields are OpenAI Responses web_search options that the
+// xAI Responses API rejects with "Argument not supported". Options xAI accepts,
+// such as filters, user_location and search_content_types, are forwarded as is.
+var xaiUnsupportedWebSearchFields = [...]string{"external_web_access", "search_context_size"}
+
+// stripUnsupportedXAIWebSearchFields removes web_search options that xAI rejects
+// and reports which ones were removed.
+func stripUnsupportedXAIWebSearchFields(raw []byte) ([]byte, []string, bool) {
+	var removed []string
+	for _, field := range xaiUnsupportedWebSearchFields {
+		if !gjson.GetBytes(raw, field).Exists() {
+			continue
+		}
+		updated, errDel := sjson.DeleteBytes(raw, field)
+		if errDel != nil {
+			return nil, nil, false
+		}
+		raw = updated
+		removed = append(removed, field)
+	}
+	return raw, removed, true
+}
+
 func normalizeXAITool(tool gjson.Result, namespaceName string, keepImageGeneration bool) ([]byte, bool, bool) {
 	toolType := tool.Get("type").String()
 	changed := false
@@ -1607,13 +1666,16 @@ func normalizeXAITool(tool gjson.Result, namespaceName string, keepImageGenerati
 		toolType = xaiFunctionToolType
 		changed = true
 	}
-	if toolType == xaiWebSearchToolType && tool.Get("external_web_access").Exists() {
-		updatedTool, errDel := sjson.DeleteBytes(raw, "external_web_access")
-		if errDel != nil {
+	if toolType == xaiWebSearchToolType {
+		updatedTool, removed, ok := stripUnsupportedXAIWebSearchFields(raw)
+		if !ok {
 			return nil, false, false
 		}
-		raw = updatedTool
-		changed = true
+		if len(removed) > 0 {
+			raw = updatedTool
+			changed = true
+			log.Debugf("xai: removed unsupported web_search fields %v", removed)
+		}
 	}
 	if toolType == xaiFunctionToolType && !schemaTool.Get("parameters").Exists() {
 		updatedTool, errSet := sjson.SetRawBytes(raw, "parameters", []byte(`{"type":"object","properties":{}}`))
